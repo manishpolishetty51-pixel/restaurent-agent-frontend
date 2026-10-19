@@ -1,13 +1,15 @@
 import "./style.css";
 import { demoChat } from "./demo";
-import { parseAgentResponse, type AgentResult, type ToolResult } from "./schemas";
+import { parseAgentResponse, type AgentResult, type Options, type ToolResult } from "./schemas";
 
 /*
  * Backend: restaurent-agent (FastAPI)
  *   POST /chat   { message, history: [{role, content}] }
- *                -> { reply, tool_calls: [{name, output}], jev: {intent, confidence, available} }
+ *                -> { google: { source, reply, tool_calls: [{name, args, output}] },
+ *                     jev:    { source, intent, confidence, available },
+ *                     options:{ prompt, choices: [{label, message|null}] } }
  *   GET  /health -> { status: "ok" }
- * reply = Gemini agent output; jev = TypeSafe classifier output. Both are shown.
+ * google = Gemini agent output; jev = TypeSafe classifier output; options = next clickable choices.
  */
 
 function $<T extends HTMLElement>(id: string): T {
@@ -81,7 +83,8 @@ function renderTool(t: ToolResult): HTMLElement {
   }
 
   const c = t.call;
-  box.append(el("div", "tool-name", `🔧 ${c.name}`));
+  const args = Object.entries(c.args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ");
+  box.append(el("div", "tool-name", `🔧 ${c.name}(${args})`));
   const grid = el("div", "cards");
 
   // Exhaustive switch: adding a tool to the schema without a renderer is a compile error.
@@ -125,7 +128,7 @@ function renderTool(t: ToolResult): HTMLElement {
 
 function renderJev(jev: NonNullable<AgentResult["jev"]>, toolNames: string[]): HTMLElement {
   const box = el("div", "jev");
-  box.append(el("span", "jev-label", "Jev"));
+  box.append(el("span", "jev-label", jev.source));
   if (!jev.available) {
     box.append(el("span", "badge bad", "unavailable"));
     return box;
@@ -136,13 +139,36 @@ function renderJev(jev: NonNullable<AgentResult["jev"]>, toolNames: string[]): H
   return box;
 }
 
+/** Clickable choices from the backend. `message: null` means "let me type my own". */
+function renderOptions(o: Options): HTMLElement {
+  const box = el("div", "options");
+  box.append(el("div", "options-prompt", o.prompt));
+  const row = el("div", "chips-row");
+  for (const c of o.choices) {
+    const b = el("button", c.message === null ? "own" : "", c.label);
+    b.type = "button";
+    b.addEventListener("click", () => {
+      if (c.message === null) { input.focus(); return; }
+      void send(c.message);
+    });
+    row.append(b);
+  }
+  box.append(row);
+  return box;
+}
+
 function renderResult(r: AgentResult): void {
   r.tools.forEach((t) => chat.append(renderTool(t)));
-  if (r.reply) chat.append(el("div", "msg bot", r.reply));
+  if (r.reply) {
+    const bubble = el("div", "msg bot");
+    bubble.append(el("div", "source", r.source), document.createTextNode(r.reply));
+    chat.append(bubble);
+  }
   if (r.jev) {
     chat.append(renderJev(r.jev, r.tools.map((t) => (t.ok ? t.call.name : t.name))));
     if (showJson.checked) chat.append(jsonBlock({ jev: r.jev }));
   }
+  if (r.options) chat.append(renderOptions(r.options));
   scrollDown();
 }
 
@@ -150,6 +176,8 @@ function renderResult(r: AgentResult): void {
 async function send(text: string): Promise<void> {
   text = text.trim();
   if (!text) return;
+  document.querySelectorAll(".options").forEach((n) => n.remove()); // old choices are stale now
+  $("chips").hidden = true;
   chat.append(el("div", "msg user", text));
   input.value = "";
   const typing = el("div", "msg bot typing", "Thinking…");

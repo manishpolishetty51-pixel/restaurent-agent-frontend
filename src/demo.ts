@@ -1,5 +1,5 @@
-/** Offline stand-in for POST /chat. Returns exactly what the real backend returns (tool outputs as strings). */
-import { Jev } from "./schemas";
+/** Offline stand-in for POST /chat. Returns exactly what the real backend returns. */
+import type { Jev, Options } from "./schemas";
 
 const RESTAURANTS: Record<string, Array<[string, number, string]>> = {
   indian: [["Spice Palace", 4.5, "₹₹"], ["Curry House", 4.3, "₹₹"], ["Taj Flavors", 4.7, "₹₹₹"]],
@@ -24,12 +24,23 @@ const SLOTS: Record<string, boolean[]> = {
   "Taco Fiesta": [true, true, true], "Curry House": [true, false, true], "Taj Flavors": [false, true, true],
 };
 
+// ---- mirrors options.py ----
+const CUISINES = ["Indian", "Italian", "Chinese", "Mexican"];
+const BOOKING_DATES: Array<[string, string]> = [["15 Nov 2024", "2024-11-15"], ["16 Nov 2024", "2024-11-16"], ["17 Nov 2024", "2024-11-17"]];
+const TYPE_MY_OWN = { label: "None of these - I'll type my own", message: null };
+const DIFFERENT = { label: "Choose a different cuisine", message: "I want a different cuisine" };
+const cuisineOptions = (prompt = "What cuisine would you like?"): Options => ({
+  prompt,
+  choices: [...CUISINES.map((c) => ({ label: c, message: `Show me ${c} restaurants` })), TYPE_MY_OWN],
+});
+
 export function demoChat(msg: string): unknown {
   const lower = msg.toLowerCase();
   const name = Object.keys(DETAILS).find((n) => lower.includes(n.toLowerCase()));
   const date = msg.match(/\d{4}-\d{2}-\d{2}/)?.[0];
   const party = Number(lower.match(/(\d+)\s*(people|persons|guests|pax)/)?.[1] ?? 2);
-  const jev = (intent: string): Jev => ({ intent, confidence: 0.92, available: true });
+  const jev = (intent: string): Jev => ({ source: "Jev", intent, confidence: 0.92, available: true });
+  const google = (reply: string, tool_calls: unknown[]) => ({ source: "Google Gemini", reply, tool_calls });
 
   if (name && date) {
     const slots = SLOTS[name];
@@ -38,30 +49,42 @@ export function demoChat(msg: string): unknown {
       : ok ? `✓ ${name} has availability for ${party} people on ${date}`
            : `✗ ${name} is fully booked for ${date}`;
     return {
-      reply: ok ? `Good news — ${name} has a table for ${party} on ${date}.` : `Sorry, ${name} is fully booked on ${date}.`,
-      tool_calls: [{ name: "check_reservation_availability", output }],
+      google: google(ok ? `Good news — ${name} has a table for ${party} on ${date}.` : `Sorry, ${name} is fully booked on ${date}.`,
+        [{ name: "check_reservation_availability", args: { restaurant_name: name, date, party_size: party }, output }]),
       jev: jev("reservation"),
+      options: { prompt: "Anything else?", choices: [{ label: `More about ${name}`, message: `Tell me about ${name}` }, DIFFERENT, TYPE_MY_OWN] },
     };
   }
   if (name) {
     return {
-      reply: `Here are the details for ${name}.`,
-      tool_calls: [{ name: "get_restaurant_details", output: JSON.stringify(DETAILS[name]) }],
+      google: google(`Here are the details for ${name}.`,
+        [{ name: "get_restaurant_details", args: { restaurant_name: name }, output: JSON.stringify(DETAILS[name]) }]),
       jev: jev("details"),
+      options: {
+        prompt: `Book a table at ${name}? Pick a date (for 2 people):`,
+        choices: [
+          ...BOOKING_DATES.map(([label, d]) => ({ label, message: `Check table availability at ${name} on ${d} for 2 people` })),
+          DIFFERENT, TYPE_MY_OWN,
+        ],
+      },
     };
   }
   const cuisine = Object.keys(RESTAURANTS).find((c) => lower.includes(c));
   if (cuisine) {
     const list = RESTAURANTS[cuisine]!.map(([n, rating, price]) => ({ name: n, rating, price }));
     return {
-      reply: `Here are some ${cuisine} restaurants you might like.`,
-      tool_calls: [{ name: "search_restaurants_by_cuisine", output: JSON.stringify(list) }],
+      google: google(`Here are some ${cuisine} restaurants you might like.`,
+        [{ name: "search_restaurants_by_cuisine", args: { cuisine_type: cuisine }, output: JSON.stringify(list) }]),
       jev: jev("search"),
+      options: {
+        prompt: "Which restaurant would you like to know more about?",
+        choices: [...list.map((r) => ({ label: r.name, message: `Tell me about ${r.name}` })), DIFFERENT, TYPE_MY_OWN],
+      },
     };
   }
   return {
-    reply: "I can search by cuisine (Indian, Italian, Chinese, Mexican), show restaurant details, or check reservations. The requested information is outside my capabilities otherwise.",
-    tool_calls: [],
+    google: google("I can search by cuisine (Indian, Italian, Chinese, Mexican), show restaurant details, or check reservations. Anything else is outside my capabilities.", []),
     jev: jev("general"),
+    options: cuisineOptions(),
   };
 }

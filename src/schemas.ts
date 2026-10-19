@@ -25,36 +25,62 @@ const jsonText = <T extends z.ZodTypeAny>(schema: T) =>
     try { return JSON.parse(v); } catch { return v; }
   }, schema);
 
-// ---- Tool calls: discriminated union on `name` (the backend sends name + output only) ----
+// ---- Tool calls: discriminated union on `name`; the backend sends name + args + output ----
 export const ToolCall = z.discriminatedUnion("name", [
   z.object({
     name: z.literal("search_restaurants_by_cuisine"),
+    args: z.object({ cuisine_type: z.string() }),
     output: jsonText(z.array(RestaurantSummary)),
   }),
   z.object({
     name: z.literal("get_restaurant_details"),
+    args: z.object({ restaurant_name: z.string() }),
     output: jsonText(z.union([RestaurantDetails, ToolError])),
   }),
   z.object({
     name: z.literal("check_reservation_availability"),
+    args: z.object({
+      restaurant_name: z.string(),
+      date: z.string(),
+      party_size: z.number(),
+    }),
     output: z.string(),
   }),
 ]);
 export type ToolCall = z.infer<typeof ToolCall>;
 
-// ---- Jev (TypeSafe) classifier result, from jev_decision.py ----
+// ---- Gemini's block: `google` in the /chat response ----
+export const Google = z.object({
+  source: z.string().default("Google Gemini"),
+  reply: z.string(),
+  tool_calls: z.array(z.unknown()),
+});
+
+// ---- Jev (TypeSafe) classifier block, from jev_decision.py ----
 export const Jev = z.object({
+  source: z.string().default("Jev"),
   intent: z.string(), // search | details | reservation | general | unknown
   confidence: z.number().nullable(),
   available: z.boolean(),
 });
 export type Jev = z.infer<typeof Jev>;
 
+// ---- Clickable choices from options.py; `message: null` means "let me type my own" ----
+export const Choice = z.object({
+  label: z.string(),
+  message: z.string().nullable(),
+});
+export const Options = z.object({
+  prompt: z.string(),
+  choices: z.array(Choice),
+});
+export type Options = z.infer<typeof Options>;
+
 // ---- Full /chat response (main.py ChatResponse) ----
 export const ChatResponse = z.object({
-  reply: z.string(),
-  tool_calls: z.array(z.unknown()),
+  google: Google,
   jev: Jev,
+  options: Options,
 });
 
 export type ToolResult =
@@ -62,19 +88,22 @@ export type ToolResult =
   | { ok: false; name: string; raw: unknown; issues: string };
 
 export type AgentResult = {
+  source: string;
   reply: string;
   tools: ToolResult[];
   jev: Jev | null;
+  options: Options | null;
 };
 
 export function parseAgentResponse(input: unknown): AgentResult {
-  // Backend returned plain text / a non-conforming shape: still show it.
+  // Backend returned a non-conforming shape: still show it instead of failing.
   const base = ChatResponse.safeParse(input);
   if (!base.success) {
     const text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
-    return { reply: text, tools: [], jev: null };
+    return { source: "Raw response", reply: text, tools: [], jev: null, options: null };
   }
-  const tools = base.data.tool_calls.map((raw): ToolResult => {
+  const { google, jev, options } = base.data;
+  const tools = google.tool_calls.map((raw): ToolResult => {
     const parsed = ToolCall.safeParse(raw);
     if (parsed.success) return { ok: true, call: parsed.data };
     const name = (raw as { name?: unknown } | null)?.name;
@@ -85,5 +114,5 @@ export function parseAgentResponse(input: unknown): AgentResult {
       issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; "),
     };
   });
-  return { reply: base.data.reply, tools, jev: base.data.jev };
+  return { source: google.source, reply: google.reply, tools, jev, options };
 }
