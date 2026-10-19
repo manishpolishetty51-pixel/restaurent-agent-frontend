@@ -108,15 +108,11 @@ export type AgentResult = {
   state: State | null;
 };
 
-export function parseAgentResponse(input: unknown): AgentResult {
-  // Backend returned a non-conforming shape: still show it instead of failing.
-  const base = ChatResponse.safeParse(input);
-  if (!base.success) {
-    const text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
-    return { source: "Raw response", reply: text, tools: [], jev: null, state: null };
-  }
-  const { google, jev, state } = base.data;
-  const tools = google.tool_calls.map((raw): ToolResult => {
+export type GoogleResult = { source: string; reply: string; tools: ToolResult[] };
+
+export function parseGoogle(input: unknown): GoogleResult {
+  const g = Google.parse(input);
+  const tools = g.tool_calls.map((raw): ToolResult => {
     const parsed = ToolCall.safeParse(raw);
     if (parsed.success) return { ok: true, call: parsed.data };
     const name = (raw as { name?: unknown } | null)?.name;
@@ -127,5 +123,13 @@ export function parseAgentResponse(input: unknown): AgentResult {
       issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; "),
     };
   });
-  return { source: google.source, reply: google.reply, tools, jev, state };
+  return { source: g.source, reply: g.reply, tools };
 }
+
+/** One line of the /chat/stream response: Jev's and Gemini's answers arrive separately, whichever is ready first. */
+export const StreamEvent = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("jev"), jev: Jev, state: State }),
+  z.object({ type: z.literal("google"), google: Google }),
+  z.object({ type: z.literal("error"), detail: z.string() }),
+]);
+export type StreamEvent = z.infer<typeof StreamEvent>;
