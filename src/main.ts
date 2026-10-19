@@ -1,15 +1,17 @@
 import "./style.css";
-import { demoChat } from "./demo";
-import { parseAgentResponse, type AgentResult, type Options, type ToolResult } from "./schemas";
+import { demoChat, questionFor } from "./demo";
+import { parseAgentResponse, type AgentResult, type Question, type State, type ToolResult } from "./schemas";
 
 /*
- * Backend: restaurent-agent (FastAPI)
- *   POST /chat   { message, history: [{role, content}] }
+ * Backend: restaurent-agent (FastAPI), a guided flow: cuisine -> restaurant -> date -> party size -> availability.
+ *   POST /chat   { message, history: [{role, content}], state? }
  *                -> { google: { source, reply, tool_calls: [{name, args, output}] },
- *                     jev:    { source, intent, confidence, available },
- *                     options:{ prompt, choices: [{label, message|null}] } }
+ *                     jev:    { source, available, understood: {question_id, choice, confidence, method},
+ *                               next_question: {id, text, choices: [{key, label, message}]} },
+ *                     state }   <- sent back unchanged with the next request
  *   GET  /health -> { status: "ok" }
- * google = Gemini agent output; jev = TypeSafe classifier output; options = next clickable choices.
+ * google = Gemini's answer; jev = how it read the user's answer + the next question to ask.
+ * The user can click a choice (sends its `message`) or type freely.
  */
 
 function $<T extends HTMLElement>(id: string): T {
@@ -30,6 +32,7 @@ apiUrl.value = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 type Turn = { role: "user" | "assistant"; content: string };
 const history: Turn[] = [];
+let state: State | null = null; // echoed back to the backend on every request
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: string): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
@@ -45,12 +48,12 @@ const base = () => apiUrl.value.replace(/\/+$/, "");
 async function ask(message: string): Promise<unknown> {
   if (demo.checked) {
     await new Promise((r) => setTimeout(r, 500));
-    return demoChat(message);
+    return demoChat(message, state);
   }
   const res = await fetch(`${base()}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({ message, history, state }),
   });
   if (!res.ok) {
     const detail = await res.json().then((j: { detail?: unknown }) => (typeof j.detail === "string" ? j.detail : null), () => null);
@@ -126,31 +129,31 @@ function renderTool(t: ToolResult): HTMLElement {
   return box;
 }
 
+/** How Jev read the user's last answer. When Jev is down, the backend falls back to text matching. */
 function renderJev(jev: NonNullable<AgentResult["jev"]>, toolNames: string[]): HTMLElement {
   const box = el("div", "jev");
   box.append(el("span", "jev-label", jev.source));
+  const u = jev.understood;
   if (!jev.available) {
-    box.append(el("span", "badge bad", "unavailable"));
-    return box;
+    box.append(el("span", "badge bad", "unavailable, matched by text"));
+  } else {
+    const pct = u.confidence === null ? "" : ` · ${Math.round(u.confidence * 100)}%`;
+    box.append(el("span", "badge", `understood ${u.question_id}: ${u.choice ?? "no match"}${pct}`));
   }
-  const pct = jev.confidence === null ? "" : ` · ${Math.round(jev.confidence * 100)}%`;
-  box.append(el("span", "badge", `intent: ${jev.intent}${pct}`));
   if (toolNames.length) box.append(el("span", "jev-note", `Gemini called ${toolNames.join(", ")}`));
   return box;
 }
 
-/** Clickable choices from the backend. `message: null` means "let me type my own". */
-function renderOptions(o: Options): HTMLElement {
+/** Jev's next question. Clicking a choice sends its `message`; typing in the box works too. */
+function renderQuestion(q: Question): HTMLElement {
   const box = el("div", "options");
-  box.append(el("div", "options-prompt", o.prompt));
+  box.append(el("div", "options-prompt", q.text));
   const row = el("div", "chips-row");
-  for (const c of o.choices) {
-    const b = el("button", c.message === null ? "own" : "", c.label);
+  for (const c of q.choices) {
+    const b = el("button", c.key === "restart" ? "own" : "", c.label);
     b.type = "button";
-    b.addEventListener("click", () => {
-      if (c.message === null) { input.focus(); return; }
-      void send(c.message);
-    });
+    b.title = c.description ?? "";
+    b.addEventListener("click", () => void send(c.message));
     row.append(b);
   }
   box.append(row);
@@ -166,9 +169,9 @@ function renderResult(r: AgentResult): void {
   }
   if (r.jev) {
     chat.append(renderJev(r.jev, r.tools.map((t) => (t.ok ? t.call.name : t.name))));
-    if (showJson.checked) chat.append(jsonBlock({ jev: r.jev }));
+    if (showJson.checked) chat.append(jsonBlock({ jev: r.jev.understood, state: r.state }));
+    chat.append(renderQuestion(r.jev.next_question));
   }
-  if (r.options) chat.append(renderOptions(r.options));
   scrollDown();
 }
 
@@ -177,7 +180,6 @@ async function send(text: string): Promise<void> {
   text = text.trim();
   if (!text) return;
   document.querySelectorAll(".options").forEach((n) => n.remove()); // old choices are stale now
-  $("chips").hidden = true;
   chat.append(el("div", "msg user", text));
   input.value = "";
   const typing = el("div", "msg bot typing", "Thinking…");
@@ -187,6 +189,7 @@ async function send(text: string): Promise<void> {
   try {
     const result = parseAgentResponse(await ask(text));
     history.push({ role: "user", content: text }, { role: "assistant", content: result.reply });
+    if (result.state) state = result.state;
     renderResult(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -200,11 +203,9 @@ async function send(text: string): Promise<void> {
 }
 
 form.addEventListener("submit", (e) => { e.preventDefault(); void send(input.value); });
-$("chips").addEventListener("click", (e) => {
-  if (e.target instanceof HTMLButtonElement) void send(e.target.textContent ?? "");
-});
 demo.addEventListener("change", () => void checkHealth());
 apiUrl.addEventListener("change", () => void checkHealth());
 
-chat.append(el("div", "msg bot", "Hi! I can find restaurants by cuisine, show details, and check reservation availability. What are you in the mood for?"));
+chat.append(el("div", "msg bot", "Hi! I can find restaurants by cuisine, show details, and check reservation availability."));
+chat.append(renderQuestion(questionFor({ asking: "cuisine" }))); // the backend's first question (flow.py START)
 void checkHealth();

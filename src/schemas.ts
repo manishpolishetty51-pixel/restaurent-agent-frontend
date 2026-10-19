@@ -49,38 +49,51 @@ export const ToolCall = z.discriminatedUnion("name", [
 ]);
 export type ToolCall = z.infer<typeof ToolCall>;
 
-// ---- Gemini's block: `google` in the /chat response ----
+// ---- `google`: Gemini's block of the /chat response ----
 export const Google = z.object({
   source: z.string().default("Google Gemini"),
   reply: z.string(),
   tool_calls: z.array(z.unknown()),
 });
 
-// ---- Jev (TypeSafe) classifier block, from jev_decision.py ----
+// ---- Jev's question format (flow.py): clicking a choice sends its `message` ----
+export const Choice = z.object({
+  key: z.string(),
+  label: z.string(),
+  description: z.string().optional(),
+  message: z.string(),
+});
+export const Question = z.object({
+  id: z.string(), // cuisine | restaurant | date | party
+  type: z.string(),
+  text: z.string(),
+  choices: z.array(Choice),
+});
+export type Question = z.infer<typeof Question>;
+
+// ---- `jev`: what Jev understood from the user's answer + the next question (jev_decision.py) ----
 export const Jev = z.object({
   source: z.string().default("Jev"),
-  intent: z.string(), // search | details | reservation | general | unknown
-  confidence: z.number().nullable(),
   available: z.boolean(),
+  understood: z.object({
+    question_id: z.string(),
+    choice: z.string().nullable(),
+    confidence: z.number().nullable(),
+    method: z.string(), // "jev" | "fallback"
+  }),
+  next_question: Question,
 });
 export type Jev = z.infer<typeof Jev>;
 
-// ---- Clickable choices from options.py; `message: null` means "let me type my own" ----
-export const Choice = z.object({
-  label: z.string(),
-  message: z.string().nullable(),
-});
-export const Options = z.object({
-  prompt: z.string(),
-  choices: z.array(Choice),
-});
-export type Options = z.infer<typeof Options>;
+/** Opaque conversation state: echoed back to the backend on the next request. */
+export const State = z.record(z.string(), z.unknown());
+export type State = z.infer<typeof State>;
 
 // ---- Full /chat response (main.py ChatResponse) ----
 export const ChatResponse = z.object({
   google: Google,
   jev: Jev,
-  options: Options,
+  state: State,
 });
 
 export type ToolResult =
@@ -92,7 +105,7 @@ export type AgentResult = {
   reply: string;
   tools: ToolResult[];
   jev: Jev | null;
-  options: Options | null;
+  state: State | null;
 };
 
 export function parseAgentResponse(input: unknown): AgentResult {
@@ -100,9 +113,9 @@ export function parseAgentResponse(input: unknown): AgentResult {
   const base = ChatResponse.safeParse(input);
   if (!base.success) {
     const text = typeof input === "string" ? input : JSON.stringify(input, null, 2);
-    return { source: "Raw response", reply: text, tools: [], jev: null, options: null };
+    return { source: "Raw response", reply: text, tools: [], jev: null, state: null };
   }
-  const { google, jev, options } = base.data;
+  const { google, jev, state } = base.data;
   const tools = google.tool_calls.map((raw): ToolResult => {
     const parsed = ToolCall.safeParse(raw);
     if (parsed.success) return { ok: true, call: parsed.data };
@@ -114,5 +127,5 @@ export function parseAgentResponse(input: unknown): AgentResult {
       issues: parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; "),
     };
   });
-  return { source: google.source, reply: google.reply, tools, jev, options };
+  return { source: google.source, reply: google.reply, tools, jev, state };
 }

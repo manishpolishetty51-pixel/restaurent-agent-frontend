@@ -1,5 +1,5 @@
-/** Offline stand-in for POST /chat. Returns exactly what the real backend returns. */
-import type { Jev, Options } from "./schemas";
+/** Offline stand-in for POST /chat. Mirrors flow.py: cuisine -> restaurant -> date -> party -> availability. */
+import type { Question, State } from "./schemas";
 
 const RESTAURANTS: Record<string, Array<[string, number, string]>> = {
   indian: [["Spice Palace", 4.5, "₹₹"], ["Curry House", 4.3, "₹₹"], ["Taj Flavors", 4.7, "₹₹₹"]],
@@ -18,73 +18,113 @@ const DETAILS: Record<string, Record<string, string | number>> = {
   "Golden Wok": { cuisine: "Chinese", rating: 4.8, address: "777 Wok Street, Central Market", phone: "9555666777", hours: "11 AM - 11 PM", speciality: "Szechuan Noodles, Dim Sum" },
 };
 
-const DATES = ["2024-11-15", "2024-11-16", "2024-11-17"];
-const SLOTS: Record<string, boolean[]> = {
-  "Spice Palace": [true, false, true], "Pizza Bella": [false, true, true], "Dragon House": [true, true, false],
-  "Taco Fiesta": [true, true, true], "Curry House": [true, false, true], "Taj Flavors": [false, true, true],
+const SLOTS: Record<string, Record<string, boolean>> = {
+  "Spice Palace": { "2024-11-15": true, "2024-11-16": false, "2024-11-17": true },
+  "Pizza Bella": { "2024-11-15": false, "2024-11-16": true, "2024-11-17": true },
+  "Dragon House": { "2024-11-15": true, "2024-11-16": true, "2024-11-17": false },
+  "Taco Fiesta": { "2024-11-15": true, "2024-11-16": true, "2024-11-17": true },
+  "Curry House": { "2024-11-15": true, "2024-11-16": false, "2024-11-17": true },
+  "Taj Flavors": { "2024-11-15": false, "2024-11-16": true, "2024-11-17": true },
 };
 
-// ---- mirrors options.py ----
-const CUISINES = ["Indian", "Italian", "Chinese", "Mexican"];
-const BOOKING_DATES: Array<[string, string]> = [["15 Nov 2024", "2024-11-15"], ["16 Nov 2024", "2024-11-16"], ["17 Nov 2024", "2024-11-17"]];
-const TYPE_MY_OWN = { label: "None of these - I'll type my own", message: null };
-const DIFFERENT = { label: "Choose a different cuisine", message: "I want a different cuisine" };
-const cuisineOptions = (prompt = "What cuisine would you like?"): Options => ({
-  prompt,
-  choices: [...CUISINES.map((c) => ({ label: c, message: `Show me ${c} restaurants` })), TYPE_MY_OWN],
+// ---- mirrors flow.py ----
+export const CUISINES = ["Indian", "Italian", "Chinese", "Mexican"];
+const DATES: Array<[string, string]> = [["15 Nov 2024", "2024-11-15"], ["16 Nov 2024", "2024-11-16"], ["17 Nov 2024", "2024-11-17"]];
+const PARTY_SIZES = [2, 4, 6];
+const RESTART_LABEL = "None of these - start over";
+
+type Choice = Question["choices"][number];
+const choice = (key: string, label: string, description: string): Choice => ({ key, label, description, message: label });
+const question = (id: string, text: string, choices: Choice[], restartable = true): Question => ({
+  id, type: "choice", text,
+  choices: restartable ? [...choices, choice("restart", RESTART_LABEL, "The user wants to start over")] : choices,
 });
 
-export function demoChat(msg: string): unknown {
-  const lower = msg.toLowerCase();
-  const name = Object.keys(DETAILS).find((n) => lower.includes(n.toLowerCase()));
-  const date = msg.match(/\d{4}-\d{2}-\d{2}/)?.[0];
-  const party = Number(lower.match(/(\d+)\s*(people|persons|guests|pax)/)?.[1] ?? 2);
-  const jev = (intent: string): Jev => ({ source: "Jev", intent, confidence: 0.92, available: true });
-  const google = (reply: string, tool_calls: unknown[]) => ({ source: "Google Gemini", reply, tool_calls });
+export function questionFor(state: State): Question {
+  const asking = (state.asking as string | undefined) ?? "cuisine";
+  if (asking === "restaurant") {
+    const cuisine = state.cuisine as string;
+    return question("restaurant", `Which ${cuisine} restaurant would you like?`,
+      (RESTAURANTS[cuisine.toLowerCase()] ?? []).map(([n]) => choice(n, n, `The restaurant ${n}`)));
+  }
+  if (asking === "date") {
+    return question("date", `When would you like to book ${state.restaurant as string}?`,
+      DATES.map(([label, iso]) => choice(iso, label, `The date ${label}`)));
+  }
+  if (asking === "party") {
+    return question("party", "How many people?", PARTY_SIZES.map((n) => choice(String(n), `${n} people`, `A party of ${n}`)));
+  }
+  return question("cuisine", "What cuisine would you like?", CUISINES.map((c) => choice(c.toLowerCase(), c, `${c} cuisine`)), false);
+}
 
-  if (name && date) {
-    const slots = SLOTS[name];
-    const ok = !!slots?.[DATES.indexOf(date)];
-    const output = !slots ? `Restaurant '${name}' not found.`
-      : ok ? `✓ ${name} has availability for ${party} people on ${date}`
-           : `✗ ${name} is fully booked for ${date}`;
+function matchLabel(q: Question, message: string): string | null {
+  const t = message.trim().toLowerCase();
+  return q.choices.find((c) => t === c.label.toLowerCase() || t === c.key.toLowerCase())?.key ?? null;
+}
+
+type Step = { state: State; reply: string; tool: unknown | null; notice: string | null };
+
+function step(state: State, picked: string | null): Step {
+  const asking = (state.asking as string | undefined) ?? "cuisine";
+  const same: Step = {
+    state, notice: null, tool: null,
+    reply: "I can only help with restaurants here. Pick one of the options below, or ask about a cuisine, restaurant or booking.",
+  };
+  if (picked === null) return same;
+  if (picked === "restart" && asking !== "cuisine") {
+    return { state: { asking: "cuisine" }, reply: "No problem, let's begin again!", tool: null, notice: "Okay, let's start over." };
+  }
+  if (asking === "cuisine") {
+    const cuisine = CUISINES.find((c) => c.toLowerCase() === picked);
+    if (!cuisine) return same;
+    const list = RESTAURANTS[picked]!.map(([name, rating, price]) => ({ name, rating, price }));
     return {
-      google: google(ok ? `Good news — ${name} has a table for ${party} on ${date}.` : `Sorry, ${name} is fully booked on ${date}.`,
-        [{ name: "check_reservation_availability", args: { restaurant_name: name, date, party_size: party }, output }]),
-      jev: jev("reservation"),
-      options: { prompt: "Anything else?", choices: [{ label: `More about ${name}`, message: `Tell me about ${name}` }, DIFFERENT, TYPE_MY_OWN] },
+      state: { asking: "restaurant", cuisine }, notice: null,
+      reply: `Here are some ${cuisine} restaurants you might like.`,
+      tool: { name: "search_restaurants_by_cuisine", args: { cuisine_type: cuisine }, output: JSON.stringify(list) },
     };
   }
-  if (name) {
+  if (asking === "restaurant") {
     return {
-      google: google(`Here are the details for ${name}.`,
-        [{ name: "get_restaurant_details", args: { restaurant_name: name }, output: JSON.stringify(DETAILS[name]) }]),
-      jev: jev("details"),
-      options: {
-        prompt: `Book a table at ${name}? Pick a date (for 2 people):`,
-        choices: [
-          ...BOOKING_DATES.map(([label, d]) => ({ label, message: `Check table availability at ${name} on ${d} for 2 people` })),
-          DIFFERENT, TYPE_MY_OWN,
-        ],
-      },
+      state: { ...state, asking: "date", restaurant: picked }, notice: null,
+      reply: `Here are the details for ${picked}.`,
+      tool: { name: "get_restaurant_details", args: { restaurant_name: picked }, output: JSON.stringify(DETAILS[picked] ?? { error: `Restaurant '${picked}' not found` }) },
     };
   }
-  const cuisine = Object.keys(RESTAURANTS).find((c) => lower.includes(c));
-  if (cuisine) {
-    const list = RESTAURANTS[cuisine]!.map(([n, rating, price]) => ({ name: n, rating, price }));
+  if (asking === "date") {
+    return { state: { ...state, asking: "party", date: picked }, notice: null, tool: null, reply: `Great, ${picked} it is.` };
+  }
+  if (asking === "party") {
+    const party = Number(picked);
+    const name = state.restaurant as string;
+    const date = state.date as string;
+    const ok = !!SLOTS[name]?.[date];
+    const output = ok ? `✓ ${name} has availability for ${party} people on ${date}` : `✗ ${name} is fully booked for ${date}`;
     return {
-      google: google(`Here are some ${cuisine} restaurants you might like.`,
-        [{ name: "search_restaurants_by_cuisine", args: { cuisine_type: cuisine }, output: JSON.stringify(list) }]),
-      jev: jev("search"),
-      options: {
-        prompt: "Which restaurant would you like to know more about?",
-        choices: [...list.map((r) => ({ label: r.name, message: `Tell me about ${r.name}` })), DIFFERENT, TYPE_MY_OWN],
-      },
+      state: { asking: "cuisine" },
+      reply: ok ? `Good news, ${name} has a table for ${party} on ${date}.` : `Sorry, ${name} is fully booked on ${date}. We'll start over.`,
+      tool: { name: "check_reservation_availability", args: { restaurant_name: name, date, party_size: party }, output },
+      notice: ok ? "Good news, that table is available! Want to look for another?" : "Sorry, that table isn't available. Let's start over.",
     };
   }
+  return same;
+}
+
+export function demoChat(message: string, state: State | null): unknown {
+  const current: State = state ?? { asking: "cuisine" };
+  const asked = questionFor(current);
+  const picked = matchLabel(asked, message);
+  const s = step(current, picked);
+  const next = questionFor(s.state);
+  if (s.notice) next.text = `${s.notice} ${next.text}`;
   return {
-    google: google("I can search by cuisine (Indian, Italian, Chinese, Mexican), show restaurant details, or check reservations. Anything else is outside my capabilities.", []),
-    jev: jev("general"),
-    options: cuisineOptions(),
+    google: { source: "Google Gemini", reply: s.reply, tool_calls: s.tool ? [s.tool] : [] },
+    jev: {
+      source: "Jev",
+      available: true,
+      understood: { question_id: asked.id, choice: picked ?? "other", confidence: picked ? 0.95 : 0.5, method: "jev" },
+      next_question: next,
+    },
+    state: s.state,
   };
 }
